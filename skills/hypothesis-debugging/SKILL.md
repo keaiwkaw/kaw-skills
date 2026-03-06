@@ -37,7 +37,7 @@ version: 1.0.0
 - **禁止**：在验证成功前移除埋点
 - **禁止**：使用 setTimeout/sleep/delay 作为"修复"手段
 - **禁止**：记录敏感信息（密码、token、API key、PII）
-- **必须**：每次复现前清空日志文件
+- **必须**：每次复现或验证前清空日志文件
 - **必须**：修复后对比 Before/After 日志，引用具体日志行
 - **必须**：假设被否定后，回滚相关代码修改（只保留被证实的修复）
 
@@ -87,9 +87,38 @@ rm -f ~/.codeflicker/debug.log
 
 ⚠️ 清空日志文件 ≠ 移除埋点代码，不要混淆。
 
-### 读取日志文件
+### 读取日志文件（带健康检查与自愈）
 
-用户回复 `done` 后，使用 `read_file` 工具读取 `~/.codeflicker/debug.log` 进行分析。
+用户回复 `done` 后，**不要**直接假设日志文件一定存在。
+
+#### 触发自检的时机（任一满足即可）
+
+- `read_file` 读取 `~/.codeflicker/debug.log` 失败（文件不存在/权限问题）
+- 发现日志文件不存在，且你不确定日志服务器是否还在运行
+- 你不确定当前日志服务器端口（例如丢失了启动输出的 JSON）
+
+#### 自检与自愈流程
+
+1. **优先探测已知端口**：如果你记录过启动输出里的 `{port}`，先调用：
+
+   ```
+   http://127.0.0.1:{port}/health
+   ```
+2. **如果端口未知**：从 7491 到 7500 依次调用 `/health`（最多 10 次）
+3. **若任一 health 成功**：
+   - 说明服务在运行；根据返回值里的 `exists` 判断日志文件是否存在
+   - 若 `exists=false`：不要判定服务终止，而是提示“埋点可能未触发/复现步骤未走到”，并让用户再复现一次后回复 `done`
+4. **若所有 health 都失败**：视为服务可能未启动/已退出 → **使用 `execute_command` 后台重新启动日志服务器**：
+
+   ```bash
+   python {SKILL_DIR}/scripts/log-server.py
+   ```
+
+   然后解析启动输出 JSON 获取新的 `{port}`，再次调用 `/health` 确认启动成功。
+
+5. **确认服务可用后**：再用 `read_file` 读取 `~/.codeflicker/debug.log` 分析。
+
+> 注意：日志文件不存在 ≠ 服务已终止。更常见原因是“埋点没触发”或“复现步骤未覆盖到埋点路径”。
 
 ## 日志代码模板
 
@@ -139,7 +168,10 @@ with open(os.path.expanduser('~/.codeflicker/debug.log'), 'a') as f:
 
 ```go
 // region debug-mode-log
-if f, err := os.OpenFile(".codeflicker/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+// 需要引入："path/filepath"
+home, _ := os.UserHomeDir()
+logPath := filepath.Join(home, ".codeflicker", "debug.log")
+if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
     json.NewEncoder(f).Encode(map[string]interface{}{"hypothesisId":"H1","runId":"run-1","location":"file.go:LINE","message":"desc","data":nil,"timestamp":time.Now().UnixMilli()})
     f.Close()
 }
@@ -215,9 +247,10 @@ if f, err := os.OpenFile(".codeflicker/debug.log", os.O_APPEND|os.O_CREATE|os.O_
 ```markdown
 ## ✅ 验证步骤
 
-1. 重新启动应用
-2. 执行相同操作
-3. 确认问题是否解决
+1. 清空日志文件：`rm -f ~/.codeflicker/debug.log`
+2. 重新启动应用
+3. 执行相同操作
+4. 确认问题是否解决
 
 - 如果问题已解决，回复 `fixed`
 - 如果问题仍存在，回复 `failed`
@@ -259,9 +292,8 @@ if f, err := os.OpenFile(".codeflicker/debug.log", os.O_APPEND|os.O_CREATE|os.O_
 当用户回复 `fixed` 确认成功后：
 
 1. **移除所有埋点代码** - 删除 `// #region debug-mode-log` 到 `// #endregion debug-mode-log` 之间的代码
-2. **删除日志文件** - 删除 `.codeflicker/debug.log`
-3. **停止日志服务器** - 提示用户停止服务（如果之前启动了）
-4. **停止日志服务器**（Agent 自动执行）
+2. **删除日志文件** - 删除 `~/.codeflicker/debug.log`
+3. **停止日志服务器**（Agent 自动执行）
 
 ```bash
 kill $(lsof -t -i:{port}) 2>/dev/null || true
